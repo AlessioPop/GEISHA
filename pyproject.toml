@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geisha"
+version = "0.1.0"
+description = "Interactive tools for astronomical interferometry analysis"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "astropy",
+    "matplotlib",
+    "numpy",
+    "orbitize",
+    "pmoired",
+    "rebound",
+    "scipy",
+    "rich",
+    "typer",
+]
+
+[project.scripts]
+geisha = "geisha.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
