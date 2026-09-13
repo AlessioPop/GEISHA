@@ -5,9 +5,10 @@ user starts a plot from a row, so the builder opens already scoped to it.
 """
 
 import curses
+from pathlib import Path
 
+from rich import box
 from rich.console import Group
-from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -27,18 +28,21 @@ def tab_rows(session, tab):
 
 def data_table(tab, rows, offset, page, selected, width):
     """One Rich table per tab, dropping the least useful columns when narrow."""
-    table = Table(expand=True, box=None, padding=(0, 1), pad_edge=False,
-                  header_style='dim', show_edge=False)
+    from .session import channel_breaks
+    breaks = channel_breaks(rows) if tab in ('Observables', 'Baselines') else set()
+    table = Table(expand=True, box=box.ROUNDED, padding=(0, 1),
+                  header_style='bold cyan', border_style='dim cyan')
     wide, roomy = width >= 88, width >= 68
     if tab == 'Files':
         table.add_column('#', width=3, justify='right', no_wrap=True)
-        table.add_column('File', ratio=1, no_wrap=True, overflow='ellipsis')
+        table.add_column('File', ratio=3, no_wrap=True, overflow='ellipsis')
+        if width >= 110:
+            table.add_column('Folder', ratio=2, no_wrap=True, overflow='ellipsis')
+        if wide:
+            table.add_column('Instrument', ratio=2, no_wrap=True, overflow='ellipsis')
         table.add_column('Usable', width=9, justify='right', no_wrap=True)
         if roomy:
-            table.add_column('Records', width=8, justify='right', no_wrap=True)
-            table.add_column('HDUs', width=5, justify='right', no_wrap=True)
-        if wide:
-            table.add_column('Observables', width=26, no_wrap=True, overflow='ellipsis')
+            table.add_column('Night (UTC)', width=10, no_wrap=True, overflow='ellipsis')
     elif tab == 'Observables':
         table.add_column('Obs', width=6, no_wrap=True)
         table.add_column('Instrument', ratio=1, no_wrap=True, overflow='ellipsis')
@@ -63,13 +67,16 @@ def data_table(tab, rows, offset, page, selected, width):
         focus = index == selected
         dim = '' if focus else 'dim'
         if tab == 'Files':
-            cells = [Text(str(row['number'])),
-                     Text(clip(row['name'], max(10, width - 30)), style='bold' if focus else ''),
-                     Text(f"{row['usable']:,}")]
-            if roomy:
-                cells += [Text(str(row['records'])), Text(str(row['hdus']))]
+            cells = [Text(str(row['number']), style=dim),
+                     Text(printable(row['name']), style='bold')]
+            if width >= 110:
+                cells.append(Text(printable(str(Path(row['path']).parent)), style=dim))
             if wide:
-                cells.append(Text(','.join(row['observables']), style=dim))
+                cells.append(Text(', '.join(row['instruments']), style=dim))
+            cells.append(Text(f"{row['usable']:,}"))
+            if roomy:
+                nights = row['nights']
+                cells.append(Text(nights[0] if len(nights) == 1 else f'{len(nights)} nights'))
         elif tab == 'Observables':
             cells = [Text(row['observable'], style='bold' if focus else 'cyan'),
                      Text(printable(f"{row['instrument']} · {row['target']}"), style=dim),
@@ -88,7 +95,9 @@ def data_table(tab, rows, offset, page, selected, width):
                 cells += [Text(f"{row['usable']:,}"), Text(str(row['files']))]
             if wide:
                 cells.append(Text(','.join(row['observables']), style=dim))
-        table.add_row(*cells, style='reverse' if focus else '')
+        # A rule wherever the instrument changes, so each channel reads as its own table.
+        table.add_row(*cells, style='reverse bold' if focus else '',
+                      end_section=index in breaks)
     for _ in range(max(0, page - max(1, len(rows[offset:offset + page])))):
         table.add_row(Text(' '))
     return table
@@ -116,12 +125,13 @@ def data_layout(session, tab, rows, selected, offset, width, height):
     for name in TABS:
         strip.append(f' {name} ', style='reverse bold' if name == tab else 'dim')
         strip.append(' ')
-    strip.append(f'· {len(rows)} row' + ('s' if len(rows) != 1 else ''), style='dim')
+    strip.append(f'· {offset + 1}–{min(len(rows), offset + page)} of {len(rows)}' if rows else '· 0 rows', style='dim')
     detail = Text('No rows in this view.', style='dim', no_wrap=True, overflow='ellipsis')
     if rows:
         row = rows[selected]
         if tab == 'Files':
-            detail = Text(clip(row['path'], width), style='dim', no_wrap=True)
+            detail = Text(clip(row['path'], max(1, width - 25)) + ' · ' + ', '.join(row['nights']),
+                          style='dim', no_wrap=True, overflow='ellipsis')
         elif tab == 'Observables':
             detail = Text(printable(f"{row['observable']} · {row['instrument']} · {row['records']} records"
                                     f" · {row['baselines']} baselines · {row['usable']:,} usable samples"),
@@ -131,13 +141,16 @@ def data_layout(session, tab, rows, selected, offset, width, height):
                                     f" · {row['files']} files · {', '.join(row['observables'])}"),
                           style='dim', no_wrap=True, overflow='ellipsis')
     action = 'Enter headers' if tab == 'Files' else 'Enter plot'
-    controls = (f'←→ tabs · {action} · P plot builder · Esc close' if width < 76 else
-                f'↑↓ move · ←→/Tab switch tabs · {action} · P plot builder · H headers · Esc close')
+    controls = (f'←→ tabs · {action} · A all data · P builder · Esc close' if width < 76 else
+                f'↑↓ move · ←→/Tab tabs · {action} · A all observables · '
+                'P builder · H headers · Esc close')
     footer = Text(controls, no_wrap=True, overflow='ellipsis')
     footer.highlight_words(['↑↓', '←→', 'Tab', 'Enter', 'P', 'H', 'Esc'], 'cyan')
-    return Group(title, subtitle, strip, Rule(style='dim'),
+    # Same offer, same colour as the plot builder: one key to every observable.
+    footer.highlight_words(['A all data', 'A all observables'], 'bold cyan')
+    return Group(title, subtitle, strip,
                  data_table(tab, rows, offset, page, selected, width),
-                 Rule(style='dim'), detail, footer), offset, page
+                 detail, footer), offset, page
 
 
 def browse_data(screen, session, accent=0, tab='Files'):
@@ -169,6 +182,10 @@ def browse_data(screen, session, accent=0, tab='Files'):
                 step = -1 if key in (curses.KEY_LEFT, curses.KEY_BTAB) else 1
                 tab = TABS[(TABS.index(tab) + step) % len(TABS)]
                 selected = offset = 0
+            elif key in ('a', 'A'):
+                # Straight to the overview, scoped to whatever the row is about.
+                seed = plot_seed(tab, rows[selected]) if rows else {}
+                return {**seed, 'plot': 'all'}
             elif key in ('h', 'H') or (key in ENTER_KEYS and tab == 'Files'):
                 from .headers import browse_headers
                 browse_headers(screen, session, accent, files_first=True)

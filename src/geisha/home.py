@@ -6,15 +6,15 @@ import re
 import textwrap
 import time
 from datetime import date
-from pathlib import Path
 
 from rich.cells import cell_len
 from rich.console import Group
 from rich.table import Table
 from rich.text import Text
 
-from .session import COMMANDS
-from .tui import clip, cursor_cell, make_console, paint_rich, printable, wrap_input
+from .session import COMMANDS, is_alert
+from .theme import alert_attribute
+from .tui import cursor_cell, make_console, paint_rich, printable, wrap_input
 
 # Short splash messages, chosen once per launch so redraws keep the same line.
 # Instrument facts: ESO's VLTI, GRAVITY, METIS and ELT mirror pages.
@@ -85,6 +85,8 @@ FACES = {
     'proud': '(˶ᵔ⤙ᵔ˶)', 'working': '(˶• ᵕ •˶)',
 }
 BLINK = '(˶˘ ᵕ ˘˶)'
+# Expressions GEISHA wears when something went wrong; they speak in alert red.
+ALERT_EMOTIONS = ('sad', 'crying', 'nervous', 'scared', 'surprised', 'angry')
 EMOTION_ROUTES = {
     'happy': ('(˶• ᵕ •˶)', '(˶ᵔ ᵕ ᵔ˶)', '(˶˃ ᵕ ᵔ˶)'),
     'surprised': ('(˶• ᵕ •˶)', '(˶• ㅁ •˶)'),
@@ -173,13 +175,18 @@ class Companion:
             self.face = BLINK if target not in ('sleepy', 'crying') and (now - self.since) % 4.8 < .16 else FACES[target]
         return self.face, speech, target, elapsed
 
-    def speech_text(self, message, now=None, compact=False):
-        """Reveal new speech without restarting on input, resize or theme changes."""
+    def speech_text(self, message, now=None, compact=False, alert=False):
+        """Reveal new speech without restarting on input, resize or theme changes.
+
+        ``alert`` paints the whole line red, so a failure or a warning is the
+        one thing on the screen that does not follow the chosen theme.
+        """
         now = time.monotonic() if now is None else now
         message = printable(message)
         if message != self.spoken_message:
             self.spoken_message, self.speech_since = message, now
-        speech = Text(message, overflow='ellipsis', no_wrap=compact)
+        speech = Text(message, style='bold red' if alert else '',
+                      overflow='ellipsis', no_wrap=compact)
         commands = '|'.join(re.escape(name) for name in COMMANDS)
         # Color complete known tokens before slicing, so even the first slash
         # has the prompt's accent. Avoid matching command names inside paths.
@@ -197,7 +204,9 @@ def companion_layout(companion, width, now=None, compact=False):
     face_width = max(cell_len(value) for value in (*FACES.values(), BLINK)) + 1
     table.add_column(width=min(face_width, max(1, width - 5)), no_wrap=True, overflow='crop')
     table.add_column(ratio=1)
-    table.add_row(Text(face, style='bold cyan'), companion.speech_text(speech, now, compact))
+    alert = emotion in ALERT_EMOTIONS
+    table.add_row(Text(face, style='bold red' if alert else 'bold cyan'),
+                  companion.speech_text(speech, now, compact, alert))
     if emotion == 'working' and not compact:
         size = min(20, max(5, width - 30))
         position = int(elapsed * 8) % (2 * (size - 3))
@@ -260,27 +269,14 @@ def radio_waves(width, height, elapsed):
 
 
 def active_data_layout(session, width):
-    """A persistent scope indicator, independent of transient command messages."""
+    """Keep the main hub's dataset summary to one line: file count and object."""
     if not session or not session.files:
         return Group(Text('No active data · /load to choose FITS files', style='dim', no_wrap=True))
     count = len(session.files)
     prefix = f'Active data · {count} file' + ('s' if count != 1 else '') + ' · '
-    suffix = f' +{count - 1}' if count > 1 else ''
-    name = clip(Path(session.files[0]).name, max(1, width - cell_len(prefix + suffix)))
-    title = Text(prefix, style='cyan')
-    title.append(name + suffix, style='bold')
-    scope = ','.join(session.settings.get('obs', []))
-    if session.settings.get('wl ranges'):
-        low, high = session.settings['wl ranges'][0]
-        scope += f' · {low:g}–{high:g} µm'
-    else:
-        scope += ' · all wavelengths'
-    info = Table.grid(expand=True, padding=(0, 1))
-    info.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
-    info.add_column(no_wrap=True)
-    info.add_row(Text(printable(f'{scope} · {", ".join(session.targets)} · {", ".join(session.instruments)}'), style='dim'),
-                 Text('/data · /headers', style='cyan'))
-    return Group(title, info)
+    title = Text(prefix, style='cyan', no_wrap=True, overflow='ellipsis')
+    title.append(printable(', '.join(session.targets)) or 'Unknown object', style='bold')
+    return Group(title)
 
 
 def draw_screen(screen, theme, splash, text='', cursor=0, message='', elapsed=0.0,
@@ -304,7 +300,7 @@ def draw_screen(screen, theme, splash, text='', cursor=0, message='', elapsed=0.
     first_line = max(0, cursor_row - input_height + 1)
     input_y = max(0, rows - 2 - input_height)
     bar_y = input_y - 1
-    dataset_rows = (2 if rows >= 10 else 1 if rows >= 7 else 0) if session is not None else 0
+    dataset_rows = 1 if session is not None and rows >= 7 else 0
     companion_rows = (4 if rows >= 20 else 2 if rows >= 12 else 1 if rows >= 8 else 0) if companion else 0
     suggestion_count = min(len(suggestions), max(0, bar_y - 2 - dataset_rows - companion_rows))
     companion_y = bar_y - suggestion_count - companion_rows
@@ -345,7 +341,7 @@ def draw_screen(screen, theme, splash, text='', cursor=0, message='', elapsed=0.
             paint_rich(screen, console or make_console(), active_data_layout(session, columns - 2),
                        data_y, 1, columns - 2, dataset_rows, accent)
         else:
-            put(data_y, 1, f'Active: {len(session.files)} files', accent)
+            put(data_y, 1, f'Active: {len(session.files)} files · {printable(", ".join(session.targets))}', accent)
 
     if companion_rows:
         paint_rich(screen, console or make_console(),
@@ -357,11 +353,13 @@ def draw_screen(screen, theme, splash, text='', cursor=0, message='', elapsed=0.
             y = bar_y - suggestion_count + index
             active = index + offset == selected
             style = curses.A_REVERSE if active else 0
-            label = f"{'>' if active else ' '} {name:<10} {COMMANDS[name]}"
+            description = COMMANDS.get(name, COMMANDS.get(name.split(maxsplit=1)[0], ''))
+            label = f"{'>' if active else ' '} {name:<10} {description}"
             put(y, 1, label.ljust(max(0, columns - 2)), style)
             put(y, 3, name, style | accent | curses.A_BOLD)
     elif not companion_rows:
-        put(bar_y - 1, 1, message or 'Welcome back.', muted)
+        put(bar_y - 1, 1, message or 'Welcome back.',
+            theme.alert if is_alert(message) else muted)
     put(bar_y, 1, '─' * max(0, columns - 2), styles['bars'])
     style = accent | curses.A_BOLD if text.startswith('/') else 0
     for index in range(input_height):

@@ -27,7 +27,7 @@ from .browser import pick_fits, browse_tree, print_tree
 from .dataview import browse_data
 from .headers import browse_headers
 from .home import Companion, SPLASHES, STARTUP_TIP, draw_screen, input_geometry
-from .panels import color_menu, help_menu, science_panel, suggestion_menu
+from .panels import color_menu, help_menu, object_menu, science_panel, sort_menu, suggestion_menu
 from .plotui import build_plot
 from .session import COMMANDS, ScienceSession, command_matches, science_output
 from .theme import Theme
@@ -52,25 +52,41 @@ class Interface:
         self.companion.set('neutral', 'Looking in your data folder… F2 opens my suggestions.')
         root = self.session.data_root
         def discover_data():
-            try:
-                from .io import scan_data
-                result = scan_data(root)
-            except Exception as error:
-                result = ([], [f'Could not scan data: {error}'])
-            self.discovery.put(result)
+            cache, previous = {}, None
+            while not self.finished:
+                try:
+                    from .io import scan_data
+                    result = scan_data(root, cache)
+                except Exception as error:
+                    result = ([], [f'Could not scan data: {error}'])
+                if result != previous:
+                    self.discovery.put(result)
+                    previous = result
+                time.sleep(15)
         threading.Thread(target=discover_data, name='geisha-discovery', daemon=True).start()
 
     def poll_discovery(self):
         """Publish a completed read-only scan on the UI thread."""
-        if not self.discovery_pending:
-            return False
         try:
             catalog, errors = self.discovery.get_nowait()
         except queue.Empty:
-            return True
+            return self.discovery_pending
+        first_scan = self.discovery_pending
         self.discovery_pending = False
-        self.session.catalog, self.session.scan_errors = catalog, errors
-        if not self.session.files and self.companion.emotion not in ('sad', 'nervous', 'surprised'):
+        self.session.accept_catalog(catalog, errors)
+        if any('Backup failed' in error for error in errors):
+            self.companion.set('surprised', 'Some new data could not be backed up. Those files will stay in place. /scan shows the details.')
+            return False
+        if self.session.new_data:
+            message = (f'New data added: {len(self.session.new_data)} files backed up. '
+                       'Would you like me to sort them? /sort previews the folders; F2 shows the action.')
+            if self.companion.emotion in ('sad', 'nervous', 'surprised'):
+                message = self.companion.message + ' ' + message
+                self.companion.set(self.companion.emotion, message)
+            else:
+                self.companion.set('happy', message)
+            return False
+        if first_scan and not self.session.files and self.companion.emotion not in ('sad', 'nervous', 'surprised'):
             if self.session.previous:
                 count = len(self.session.previous['files'])
                 missing = sum(not Path(p).is_file() for p in self.session.previous['files'])
@@ -82,7 +98,7 @@ class Interface:
                 message = f'I found {len(catalog)} FITS file(s) in data. '
                 if gravity:
                     message += f'{gravity} are GRAVITY; {models} already have telluric models. '
-                message += 'F2 opens my suggested next steps.'
+                message += '/object browses remembered objects and nights. F2 shows next steps.'
             if errors:
                 message += ' Some folders could not be scanned; /scan shows details.'
             self.companion.set('happy', message)
@@ -150,6 +166,28 @@ class Interface:
         accent = self.theme.accent
         while command == '/help':
             command = help_menu(self.screen, self.theme)
+        if command == '/sort':
+            with self.loading(command):
+                lines = science_output(self.session, command)
+            self.companion.result(lines)
+            if self.companion.emotion in ('sad', 'nervous'):
+                return lines[0] if lines else 'See /history for details.'
+            if self.session.sort_preview and sort_menu(self.screen, self.session.sort_preview,
+                                                       self.session.data_root, accent):
+                return self.report('/sort apply')
+            return lines[0] if not self.session.sort_preview else 'Sorting deferred; files kept in place.'
+        if command == '/object' or command.startswith('/object '):
+            try:
+                parts = shlex.split(command)
+                if len(parts) <= 2:
+                    if self.session.catalog is None:
+                        with self.loading('/scan'):
+                            self.session.scan_data()
+                    name = self.session.object_name(parts[1]) if len(parts) == 2 else None
+                    chosen = object_menu(self.screen, self.session, accent, name)
+                    return self.run(chosen) if chosen else ''
+            except ValueError:
+                return self.report(command)
         if command == '/suggest':
             while True:
                 command = suggestion_menu(self.screen, self.session, accent, self.poll_discovery)
@@ -202,8 +240,15 @@ class Interface:
         previous_data = self.session.oi
         with self.loading(command):
             lines = science_output(self.session, command)
+        if command == '/sort apply':
+            # Drop snapshots taken before the move; the next scan uses the new paths.
+            while True:
+                try:
+                    self.discovery.get_nowait()
+                except queue.Empty:
+                    break
         self.companion.result(lines)
-        if self.companion.emotion in ('sad', 'nervous', 'surprised'):
+        if self.companion.emotion in ('sad', 'nervous'):
             return lines[0] if lines else 'See /history for details.'
         if self.session.oi is not previous_data:
             count = len(self.session.files)
@@ -212,7 +257,9 @@ class Interface:
             message = (f'Loaded {count} file' + ('s' if count != 1 else '') + '. '
                        + ('Warning: see /history for details.' if warned else f'Next: {next_action}. F2 lets you choose.'))
             # Show what was loaded as tables rather than as a wall of text.
-            return self.open_data(tab='Observables') or message
+            return self.open_data(tab='Files') or message
+        if self.companion.emotion == 'surprised':
+            return lines[0] if lines else 'See /history for details.'
         if len(lines) > 3:
             science_panel(self.screen, command, self.session.history_lines(), start=start)
             self.companion.activity()
@@ -242,7 +289,7 @@ def run_terminal(screen):
     entries, recall = [], None  # Submitted commands, and where ↑/↓ are browsing.
     while True:
         interface.poll_discovery()
-        suggestions = (command_matches(text) if not dismissed and cursor == len(text)
+        suggestions = (command_matches(text, interface.session) if not dismissed and cursor == len(text)
                        and '\n' not in text and screen.getmaxyx()[0] >= 6 else [])
         selected = min(selected, max(0, len(suggestions) - 1))
         interface.draw(text, cursor, message, suggestions, selected)
@@ -253,6 +300,7 @@ def run_terminal(screen):
         if key != curses.KEY_RESIZE:
             interface.companion.activity()
         if key in QUIT_KEYS:
+            interface.finished = True
             return
         previous_text = text
         if key == ESCAPE:

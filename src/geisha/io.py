@@ -1,11 +1,16 @@
 """OIFITS discovery and metadata-driven extraction, independent of instrument."""
 from pathlib import Path
+import contextlib
+import hashlib
 import os
+import re
+import shutil
+import tempfile
 import numpy as np
 from astropy.io import fits
 from astropy import units as u
 
-from .constants import is_fits
+from .constants import is_fits, object_key
 
 OBSERVABLES = {
     'V2': ('OI_VIS2', 'VIS2DATA', 'VIS2ERR'),
@@ -23,13 +28,31 @@ def target_label(value):
     return ''.join(c if c.isprintable() else '�' for c in str(value)).strip()
 
 
+def observing_night(mjd, date_obs=None):
+    """Group observations by their UTC calendar date (midnight to midnight)."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        if np.isfinite(float(mjd)) and float(mjd) > 0:
+            instant = datetime(1858, 11, 17) + timedelta(days=float(mjd))
+        elif date_obs:
+            instant = datetime.fromisoformat(str(date_obs).replace('Z', '+00:00'))
+        else:
+            return 'Unknown'
+        if instant.tzinfo is not None:
+            instant = instant.astimezone(timezone.utc)
+        return instant.date().isoformat()
+    except (ValueError, TypeError, OverflowError):
+        return 'Unknown'
+
+
 def discover(path):
     """Accept one file, or search a directory tree for OIFITS files."""
     path = Path(path).expanduser().resolve()
     if path.is_file():
         files = [path]
     elif path.is_dir():
-        files = sorted(p for p in path.rglob('*') if p.is_file() and is_fits(p))
+        files = sorted(p for p in path.rglob('*') if p.is_file() and is_fits(p)
+                       and '.backup' not in p.relative_to(path).parts)
     else:
         files = []
     if not files:
@@ -79,7 +102,7 @@ def file_metadata(path):
     path = Path(path).resolve()
     row = dict(path=str(path), name=path.name, folder=str(path.parent), targets=(),
                instruments=(), instrument='Unknown', resolution='', tellurics='n/a',
-               eligible=False, reason='', loadable=False)
+               eligible=False, reason='', loadable=False, observations=[])
     try:
         with fits.open(path, mode='readonly', memmap=False) as hdus:
             row['targets'] = tuple(sorted({target_label(r['TARGET']) for h in hdus
@@ -87,11 +110,24 @@ def file_metadata(path):
             row['instruments'] = tuple(sorted({str(h.header['INSNAME']) for h in hdus
                                                if h.name == 'OI_WAVELENGTH' and 'INSNAME' in h.header}))
             row['instrument'] = str(hdus[0].header.get('INSTRUME', '')) or ', '.join(row['instruments']) or 'Unknown'
+            targets = {int(r['TARGET_ID']): target_label(r['TARGET'])
+                       for h in hdus if h.name == 'OI_TARGET' for r in h.data}
+            observations = set()
+            for h in hdus:
+                if h.name not in {v[0] for v in OBSERVABLES.values()} or h.data is None:
+                    continue
+                for record in h.data:
+                    name = targets.get(int(record['TARGET_ID']))
+                    if name:
+                        night = observing_night(record['MJD'] if 'MJD' in h.columns.names else np.nan,
+                                                h.header.get('DATE-OBS', hdus[0].header.get('DATE-OBS')))
+                        observations.add((name, night, str(h.header.get('INSNAME', ''))))
+            row['observations'] = [dict(target=t, night=n, instrument=i) for t, n, i in sorted(observations)]
             row['loadable'] = bool(row['targets'] and row['instruments'] and
                                    any(h.name in {v[0] for v in OBSERVABLES.values()} for h in hdus))
             gravity = any(i.startswith('GRAVITY_SC') for i in row['instruments'])
             if not gravity:
-                row['reason'] = 'No supported OIFITS tables.' if not row['loadable'] else 'Telluric fitting is available for GRAVITY SC.'
+                row['reason'] = 'No supported OIFITS tables.' if not row['loadable'] else 'OIFITS observations available.'
                 return row
             row['resolution'] = str(hdus[0].header.get('ESO INS SPEC RES', '')).upper()
             row['tellurics'] = 'missing'
@@ -119,10 +155,193 @@ def file_metadata(path):
     return row
 
 
-def scan_data(root):
+@contextlib.contextmanager
+def data_lock(root):
+    """Serialize discovery and sorting so scans never see a half-finished move."""
+    import fcntl
+    with (Path(root) / '.organize.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def file_digest(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def backup_file(path, root):
+    """Keep an independent, verified byte copy of each original file version."""
+    path, root = Path(path), Path(root).resolve()
+    directory = root / '.backup'
+    if directory.is_symlink():
+        raise ValueError('The backup folder must not be a symbolic link.')
+    directory.mkdir(parents=True, exist_ok=True)
+    before = path.stat()
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=directory, suffix='.partial', delete=False) as stream:
+            temporary = Path(stream.name)
+            with path.open('rb') as source:
+                shutil.copyfileobj(source, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        digest = file_digest(temporary)
+        after = path.stat()
+        if ((before.st_size, before.st_mtime_ns, before.st_ino) !=
+                (after.st_size, after.st_mtime_ns, after.st_ino) or file_digest(path) != digest):
+            raise ValueError(f'{path.name} is still changing; backup will be retried on the next scan.')
+        destination = directory / digest / path.name
+        if destination.parent.is_symlink():
+            raise ValueError('A backup destination must not be a symbolic link.')
+        destination.parent.mkdir(exist_ok=True)
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or file_digest(destination) != digest:
+                raise ValueError(f'Existing backup failed verification: {destination}')
+        else:
+            os.link(temporary, destination)
+        return dict(backup=str(destination), sha256=digest)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def sorting_plan(catalog, root, object_names=()):
+    """Plan instrument/object/chronological epoch paths without changing files."""
+    root = Path(root).resolve()
+    names = {object_key(name): name for name in object_names}
+    for row in catalog:
+        for observation in row.get('observations', []):
+            names.setdefault(object_key(observation['target']), observation['target'])
+    def folder(label):
+        clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', label).strip(' .')[:100] or 'Unknown'
+        return clean if clean == label else clean + '_' + hashlib.sha256(label.encode()).hexdigest()[:8]
+    prepared, dates = [], {}
+    for row in catalog:
+        source = Path(row['path'])
+        if not source.is_relative_to(root) or '.backup' in source.relative_to(root).parts:
+            continue
+        targets = {names[object_key(o['target'])] for o in row.get('observations', [])}
+        nights = {o['night'] for o in row.get('observations', [])}
+        item = dict(source=str(source), destination=None, sha256=row.get('sha256'), reason='')
+        if not row.get('backup'):
+            item['reason'] = 'Backup not verified; retry /scan.'
+        elif not row['loadable'] or len(targets) != 1 or len(nights) != 1:
+            item['reason'] = 'Needs review: unreadable, multiple objects, or multiple dates in one file.'
+        elif 'Unknown' in nights or any('�' in t for t in targets):
+            item['reason'] = 'Needs review: object name or UTC date is unknown.'
+        else:
+            instrument = row['instrument']
+            if all(i.startswith('GRAVITY_') for i in row['instruments']) and row['instruments']:
+                instrument = 'GRAVITY'
+            elif instrument.startswith('CHARA_NIRO_'):
+                instrument = 'CHARA_NIRO'
+            key = folder(instrument or 'Unknown instrument'), folder(next(iter(targets)))
+            night = next(iter(nights))
+            item.update(group=key, night=night)
+            dates.setdefault(key, set()).add(night)
+        prepared.append(item)
+    reserved = set()
+    for item in sorted(prepared, key=lambda r: r['source']):
+        if item['reason']:
+            continue
+        source = Path(item['source'])
+        number = sorted(dates[item['group']]).index(item['night']) + 1
+        parent = root.joinpath(*item['group'], f"Epoch {number:02d} — {item['night']}")
+        destination = parent / source.name
+        if str(destination) in reserved or (destination.exists() and destination != source):
+            suffix = hashlib.sha256(str(source).encode()).hexdigest()[:10]
+            destination = parent / (source.stem + '_' + suffix + source.suffix)
+        if str(destination) in reserved or (destination.exists() and destination != source):
+            item['reason'] = 'Destination already exists; nothing will be overwritten.'
+            continue
+        if not destination.resolve().is_relative_to(root) or any(p.is_symlink() for p in [destination, *destination.parents] if p.is_relative_to(root)):
+            item['reason'] = 'Destination contains a symbolic link; needs review.'
+            continue
+        reserved.add(str(destination))
+        item['destination'] = str(destination)
+    return [r for r in prepared if r['reason'] or r['source'] != r['destination']]
+
+
+@contextlib.contextmanager
+def organize_files(plan, root):
+    """Create destinations exclusively; commit memory before removing originals.
+
+    Until the caller commits, all original paths remain available. An interruption
+    can leave extra copies, but never leaves the only copy in a staging directory.
+    """
+    root = Path(root).resolve()
+    result = dict(paths={}, warnings=[])
+    created = []
+    with data_lock(root):
+        try:
+            for item in plan:
+                if item['reason'] or not item['destination']:
+                    continue
+                source, destination = Path(item['source']), Path(item['destination'])
+                if (source.is_symlink() or not source.resolve().is_relative_to(root)
+                        or not destination.resolve().is_relative_to(root)
+                        or any(p.is_symlink() for p in destination.parents if p.is_relative_to(root))):
+                    raise ValueError('The sorting paths changed; review /sort again.')
+                if destination.exists() or destination.is_symlink():
+                    raise ValueError(f'Destination exists: {destination}. Review /sort again.')
+                backup = backup_file(source, root)
+                if backup['sha256'] != item['sha256']:
+                    raise ValueError(f'{source.name} changed since the preview. Review /sort again.')
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(source, destination)
+                except OSError as error:
+                    import errno
+                    if error.errno != errno.EXDEV:
+                        raise
+                    with destination.open('xb') as stream:
+                        created.append(destination)
+                        with source.open('rb') as data:
+                            shutil.copyfileobj(data, stream)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                if destination not in created:
+                    created.append(destination)
+                if file_digest(destination) != item['sha256']:
+                    raise ValueError(f'{source.name} changed while being sorted; originals retained.')
+                result['paths'][str(source)] = str(destination)
+            yield result
+        except BaseException:
+            for destination in reversed(created):
+                destination.unlink(missing_ok=True)
+            raise
+        expected = {r['source']: r['sha256'] for r in plan}
+        for source, destination in result['paths'].items():
+            try:
+                if file_digest(source) != expected[source] or file_digest(destination) != expected[source]:
+                    raise ValueError('source changed during sorting')
+                Path(source).unlink()
+                parent = Path(source).parent
+                if re.fullmatch(r'Epoch(?:_\d+_| \d+ — )\d{4}-\d{2}-\d{2}', parent.name):
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        pass
+            except (OSError, ValueError) as error:
+                result['warnings'].append(f'Warning: sorted copy ready, but original retained at {source}: {error}')
+
+
+def scan_data(root, cache=None):
+    """Back up and catalogue new or changed FITS, excluding private folders."""
+    root = Path(root).resolve()
+    if not root.is_dir():
+        return [], [f'No data folder at {root}. /load can open files elsewhere.']
+    with data_lock(root):
+        return _scan_data(root, cache)
+
+
+def _scan_data(root, cache=None):
     """Recursively catalogue FITS, skipping hidden folders and symbolic links."""
     rows, errors = [], []
-    root = Path(root)
+    root = Path(root).resolve()
     if not root.is_dir():
         return rows, [f'No data folder at {root}. /load can open files elsewhere.']
     def failed(error):
@@ -133,7 +352,32 @@ def scan_data(root):
         for name in sorted(files):
             path = Path(folder) / name
             if not name.startswith('.') and is_fits(path) and not path.is_symlink():
-                rows.append(file_metadata(path))
+                try:
+                    stat = path.stat()
+                    stamp = (stat.st_mtime_ns, stat.st_size)
+                    previous = cache.get(str(path)) if cache is not None else None
+                    if previous and previous[0] == stamp and previous[1].get('backup') and Path(previous[1]['backup']).is_file():
+                        row = previous[1]
+                    else:
+                        try:
+                            backup = backup_file(path, root)
+                        except (OSError, ValueError) as error:
+                            row = file_metadata(path)
+                            errors.append(f'Backup failed for {path.name}: {error}')
+                        else:
+                            # Read the verified snapshot so its metadata and digest
+                            # describe the same bytes, even during a new file copy.
+                            row = file_metadata(backup['backup'])
+                            row.update(path=str(path), name=path.name, folder=str(path.parent), **backup)
+                    if cache is not None:
+                        cache[str(path)] = stamp, row
+                    rows.append(row)
+                except OSError as error:
+                    errors.append(str(error))
+    if cache is not None:
+        present = {r['path'] for r in rows}
+        for path in set(cache) - present:
+            del cache[path]
     return rows, errors
 
 
@@ -253,7 +497,7 @@ def inspect_files(paths, insname=None, target=None):
                     stations = arrays.get(h.header.get('ARRNAME', ''), {})
                     for row in h.data:
                         targ = targets.get(int(row['TARGET_ID']), str(row['TARGET_ID']))
-                        if target is not None and targ != target:
+                        if target is not None and object_key(targ) != object_key(target):
                             continue
                         value = np.atleast_1d(np.array(row[column], float))
                         err = np.atleast_1d(np.array(row[error], float))
@@ -266,34 +510,49 @@ def inspect_files(paths, insname=None, target=None):
                         mask = flag | ~np.isfinite(value) | ~np.isfinite(err) | (err <= 0)
                         sta = np.atleast_1d(row['STA_INDEX']) if 'STA_INDEX' in h.columns.names else []
                         ucoord, vcoord, length = baseline_geometry(row, h.columns.names)
-                        records.append(dict(file=str(path), instrument=name, target=targ, observable=obs,
+                        mjd = float(row['MJD']) if 'MJD' in h.columns.names else np.nan
+                        night = observing_night(mjd, h.header.get('DATE-OBS', hdus[0].header.get('DATE-OBS')))
+                        records.append(dict(file=str(path), instrument=name, target=targ, observable=obs, night=night,
                                             wavelength=wave.copy(), value=value, error=err, mask=mask,
                                             baseline='-'.join(stations.get(int(s), str(s)) for s in sta),
                                             u=ucoord, v=vcoord, length=length,
-                                            mjd=float(row['MJD']) if 'MJD' in h.columns.names else np.nan))
+                                            mjd=mjd))
     if not records:
         raise ValueError('No supported OIFITS observables match this selection. Image FITS cannot be fitted as interferometry.')
     return records
 
 
-def load_observations(path, insname=None, target=None):
+def load_observations(path, insname=None, target=None, night=None):
     import pmoired
     paths = [path] if isinstance(path, (str, Path)) else list(path)
     files = sorted({file for item in paths for file in discover(item)})
     if not files:
         raise ValueError('Select at least one FITS file.')
     records = inspect_files(files, insname, target)
+    if night is not None and night != 'all':
+        records = [r for r in records if r['night'] == night]
+        if not records:
+            raise ValueError(f'No observations for night {night} match this selection.')
     targets = sorted({r['target'] for r in records})
-    if len(targets) != 1:
+    if len({object_key(t) for t in targets}) != 1:
         raise ValueError('Select one target with target=NAME. Available: ' + ', '.join(targets))
+    display_target = target if target is not None else targets[0]
+    for record in records:
+        record['target'] = display_target
     # Only load files with matching records; directories may contain unrelated FITS.
     selected = sorted({r['file'] for r in records})
-    # Some files contain non-ASCII target bytes. Preserve the backend's exact key
-    # while exposing a safe display label to the terminal.
-    with fits.open(selected[0], memmap=False) as hdus:
-        backend_target = next(r['TARGET'].strip() for h in hdus if h.name == 'OI_TARGET'
-                              for r in h.data if target_label(r['TARGET']) == targets[0])
-    oi = pmoired.OI(selected, insname=insname, targname=backend_target, verbose=False, useTelluricsWl=True)
+    # PMOIRED matches exact target keys, which may differ in spelling or be bytes.
+    # Load each spelling with the key actually present in those files.
+    groups = {}
+    for filename in selected:
+        with fits.open(filename, memmap=False) as hdus:
+            names = {r['TARGET'].strip() for h in hdus if h.name == 'OI_TARGET'
+                     for r in h.data if object_key(target_label(r['TARGET'])) == object_key(display_target)}
+        for backend_target in names:
+            groups.setdefault(backend_target, []).append(filename)
+    oi = pmoired.OI()
+    for backend_target, filenames in groups.items():
+        oi.addData(filenames, insname=insname, targname=backend_target, verbose=False, useTelluricsWl=True)
     if not oi.data:
         raise ValueError('PMOIRED could not load the selected OIFITS data.')
     # Apply the same validity policy to the backend as the inspection/plot views.
@@ -307,6 +566,12 @@ def load_observations(path, insname=None, target=None):
         for table, cols in [('OI_VIS2', [('V2', 'EV2')]), ('OI_VIS', [('|V|', 'E|V|'), ('PHI', 'EPHI')]),
                             ('OI_T3', [('T3PHI', 'ET3PHI'), ('T3AMP', 'ET3AMP')]), ('OI_FLUX', [('FLUX', 'EFLUX')])]:
             for block in data.get(table, {}).values():
+                if night is not None and night != 'all':
+                    # Keep closure-triangle indices intact, but exclude other nights
+                    # from PMOIRED fits as well as GEISHA's inspection and plots.
+                    nights = [observing_night(m, data.get('header', {}).get('DATE-OBS'))
+                              for m in block['MJD']]
+                    block['FLAG'] |= np.asarray([n != night for n in nights])[:, None]
                 for value, err in cols:
                     if value in block and err in block:
                         block['FLAG'] |= ~np.isfinite(block[value]) | ~np.isfinite(block[err]) | (block[err] <= 0)

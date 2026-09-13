@@ -19,16 +19,41 @@ COLOR_KEYS = ('baseline', 'file', 'instrument', 'target', 'none')
 PHASE_OBSERVABLES = ('DPHI', 'T3PHI')
 DEFAULT_SPEC = dict(plot='V2', x='wavelength', files=(), instruments=(), baselines=(), color='baseline',
                     errors=True, xlim=None, ylim=None, legend='auto', title=None,
-                    xlabel=None, ylabel=None, continuum=None, line=None)
+                    xlabel=None, ylabel=None, continuum=None, line=None,
+                    obs=(), spectro='auto', showuv=True, flagged=False, logv=False, logb=False)
+# Options each plot target understands. 'all' and 'fit' hand the data to PMOIRED's
+# own display, which reads a different set of settings from the figures drawn here.
+DATA_OPTIONS = ('x', 'files', 'instruments', 'baselines', 'color', 'errors', 'xlim', 'ylim',
+                'legend', 'title', 'xlabel', 'ylabel', 'continuum', 'line')
+SHOW_OPTIONS = ('files', 'instruments', 'obs', 'spectro', 'showuv', 'flagged', 'logv', 'logb')
 LEGEND_LIMIT = 16  # Beyond this many series a legend hides the data.
 # Shared with the reference plotting routines in main_temp.py.
 PALETTE = ('#00B8D9', '#E040FB', '#FFAB00', '#36E26B', '#2979FF', '#FF1744')
+
+
+def target_options(target):
+    """Which /plot options apply to a target; 'save' always does."""
+    if target in ('all', 'fit'):
+        return SHOW_OPTIONS
+    if target == 'bootstrap':
+        return ()
+    return DATA_OPTIONS
 
 
 def gravity_channel(instrument):
     """Recognize GRAVITY channels, including polarized INSNAME suffixes."""
     parts = instrument.upper().split('_')
     return parts[1] if len(parts) > 1 and parts[0] == 'GRAVITY' and parts[1] in ('SC', 'FT') else None
+
+
+def instrument_order(instrument):
+    """Sort key listing the GRAVITY science channel before the fringe tracker.
+
+    SC carries the spectroscopy the science rests on; FT is the reference
+    channel, so it reads as a companion to the SC tables rather than ahead of
+    them. Anything else keeps plain alphabetical order.
+    """
+    return gravity_channel(instrument) != 'SC', instrument
 
 
 def instrument_label(instrument):
@@ -126,8 +151,7 @@ def plot_data(records, spec):
     candidates = select_records(records, {**DEFAULT_SPEC, 'plot': spec['plot']})
     labels = sorted({series_label(record, spec['color']) for record in candidates})
     colors = group_colors(labels)
-    instruments = sorted({r['instrument'] for r in chosen},
-                         key=lambda name: (gravity_channel(name) != 'SC', name))
+    instruments = sorted({r['instrument'] for r in chosen}, key=instrument_order)
     columns = min(2, len(instruments))
     rows = (len(instruments) + columns - 1) // columns
     fig, axes = plt.subplots(rows, columns, figsize=(10 if columns == 1 else 14, 5 * rows),

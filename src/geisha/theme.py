@@ -8,6 +8,9 @@ from pathlib import Path
 
 COLOR_NAMES = ('default', 'cyan', 'magenta', 'blue', 'green', 'yellow', 'red', 'white')
 COLOR_PARTS = ('logo', 'animation', 'bars', 'splash', 'commands')
+# Failures and warnings are never themed: whatever the palette, they read as alarm.
+ALERT_COLOR = 197  # xterm-256 #ff005f, the neon end of the plot palette's red.
+_alert = None
 THEMES = {
     'Observatory': dict(zip(COLOR_PARTS, ('seasonal', 'cyan', 'default', 'cyan', 'cyan'))),
     'Nebula': dict(zip(COLOR_PARTS, ('magenta', 'blue', 'magenta', 'cyan', 'cyan'))),
@@ -52,17 +55,26 @@ def save_colors(settings):
             temporary.unlink(missing_ok=True)
 
 
+def color_background():
+    """-1 keeps the terminal's own background wherever the terminal allows it."""
+    try:
+        curses.use_default_colors()
+        return -1
+    except curses.error:
+        return curses.COLOR_BLACK
+
+
+def colors_available():
+    return curses.has_colors() and 'NO_COLOR' not in os.environ
+
+
 def color_attributes():
     """Resolve every color name to a curses attribute; honours NO_COLOR."""
     attributes = dict.fromkeys(COLOR_NAMES, 0)
-    if not curses.has_colors() or 'NO_COLOR' in os.environ:
+    if not colors_available():
         return attributes
     curses.start_color()
-    background = -1
-    try:
-        curses.use_default_colors()
-    except curses.error:
-        background = curses.COLOR_BLACK
+    background = color_background()
     for pair, name in enumerate(COLOR_NAMES[1:], start=1):
         try:
             curses.init_pair(pair, getattr(curses, 'COLOR_' + name.upper()), background)
@@ -70,6 +82,29 @@ def color_attributes():
         except curses.error:
             pass
     return attributes
+
+
+def alert_attribute():
+    """The neon red that marks a failure or a warning, resolved once per session.
+
+    Terminals with a 256-color palette get the neon shade; the rest fall back to
+    bold red, and a monochrome terminal or NO_COLOR to bold alone, so the line
+    still stands out where no color can.
+    """
+    global _alert
+    if _alert is not None:
+        return _alert
+    _alert = curses.A_BOLD
+    try:
+        if colors_available():
+            curses.start_color()
+            pair = len(COLOR_NAMES)  # The named colors occupy every pair below it.
+            color = ALERT_COLOR if curses.COLORS >= 256 else curses.COLOR_RED
+            curses.init_pair(pair, color, color_background())
+            _alert = curses.color_pair(pair) | curses.A_BOLD
+    except curses.error:
+        pass
+    return _alert
 
 
 class Theme:
@@ -85,6 +120,11 @@ class Theme:
     @property
     def styles(self):
         return {part: self.style(part) for part in COLOR_PARTS}
+
+    @property
+    def alert(self):
+        """Failures and warnings ignore the theme; they always read as alarm."""
+        return alert_attribute()
 
     @property
     def accent(self):

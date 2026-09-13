@@ -11,6 +11,10 @@ from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 
+from .session import is_alert
+from .theme import alert_attribute
+
+ALERT_COLORS = ('red', 'bright_red')  # Rich names that mean 'this went wrong'.
 ESCAPE = '\x1b'
 ENTER_KEYS = ('\n', '\r', curses.KEY_ENTER)
 BACK_KEYS = (curses.KEY_BACKSPACE, '\x7f', '\b')
@@ -184,6 +188,7 @@ def clip(value, width):
 def paint_rich(screen, console, layout, top, left, width, height, accent=0):
     """Paint Rich's cell-aware layout into curses without emitting ANSI escapes."""
     options = console.options.update(width=width, height=height)
+    alert = alert_attribute()
     for y, segments in enumerate(console.render_lines(layout, options, pad=True)[:height], start=top):
         x = left
         for segment in segments:
@@ -199,7 +204,9 @@ def paint_rich(screen, console, layout, top, left, width, height, accent=0):
                 if style.reverse:
                     attribute |= curses.A_REVERSE
                 if style.color:
-                    attribute |= accent
+                    # Every colour follows the theme's accent; red is the one
+                    # exception, reserved for trouble and kept neon everywhere.
+                    attribute |= alert if style.color.name in ALERT_COLORS else accent
             screen.addstr(y, x, segment.text, attribute)
             x += segment.cell_length
 
@@ -218,10 +225,13 @@ def draw_panel(screen, title, subtitle, labels, selected, offset, footer, query=
     if selected >= offset + height:
         offset = selected - height + 1
     put(0, title, curses.A_BOLD)
-    put(1, subtitle, curses.A_DIM)
+    # A panel that opens on bad news says so in its subtitle; keep that red too.
+    put(1, subtitle, alert_attribute() if is_alert(subtitle) else curses.A_DIM)
     put(2, '─' * max(0, columns - 2), curses.A_DIM)
     for index in range(offset, min(len(labels), offset + height)):
         style = curses.A_REVERSE if index == selected else 0
+        if is_alert(labels[index]):
+            style |= alert_attribute()  # A failure stays findable while scrolling.
         put(3 + index - offset, ('> ' if index == selected else '  ') + labels[index], style)
         if query is not None and columns > 4 and 3 + index - offset < rows:
             name = labels[index].split()[0]
